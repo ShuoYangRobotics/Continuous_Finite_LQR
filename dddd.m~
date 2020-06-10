@@ -1,0 +1,179 @@
+%MAIN
+%
+% This script is used for testing the continuous, finite horizon, LQR
+% solver that I'm working on.
+%
+%
+clear; clc;
+
+
+%~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~%
+%                       User Set Parameters                               %
+%~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~%
+
+nSim = 25;
+testPerturbation = 0.1;  %Initial position error amplitude
+
+%~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~%
+%                       Draw the dynamical system                         %
+%~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~%
+
+n = 13;
+xLim = [-5,5];
+yLim = [-5,5];
+x = linspace(xLim(1),xLim(2),n);
+y = linspace(yLim(1),yLim(2),n);
+
+[xx,yy] = ndgrid(x,y);
+
+[dxx, dyy] = dynamics(xx,yy,zeros(n,n));
+
+figure(1); clf; hold on;
+title('Dynamical System - Simulations');
+quiver(xx,yy,dxx,dyy);
+xlabel('x');
+ylabel('y');
+LQR_time = 3;
+
+%~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~%
+%                    Compute a reference trajectory                       %
+%~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~%
+
+options = odeset();
+% options.Events = @(t,z)eventFunc(t,z,xLim,yLim);
+tSpan = [0 LQR_time];
+
+control = @(t) -sin(0.4*t-0.1)+0.6*cos(0.9*t+0.1);
+
+userFunc = @(t,z)rhs(t,z,control(t));
+x0 = [1;1];
+xN = [4;2];
+options.RelTol = 1e-5;
+options.AbsTol = 1e-5;
+sol = ode45(userFunc,tSpan,x0,options);
+
+nTime = 70;
+tSol = linspace(sol.x(1),sol.x(end),nTime);
+zSol = deval(sol,tSol);
+xSol = zSol(1,:);
+ySol = zSol(2,:);
+uSol = control(tSol);
+% uSol(end) = 0;
+tSpan = [tSol(1),tSol(end)];
+
+plot(xSol,ySol,'r-','LineWidth',3);
+plot(x0(1),x0(2),'ro','MarkerSize',10,'LineWidth',2)
+axis(1.2*[xLim,yLim]); axis equal;
+
+%~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~%
+%                      Store the reference trajectory                     %
+%~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~%
+
+%We will store each trajectory as a polynomial. For low-order fits, say
+%less than 10th order, Matlab's polyval and polyfit are good. For
+%higher-order fit's, it is best to use different method, based on
+%barycentric interpolation. Google chebyfun.
+% 
+% nFit = 5;  %Order of polynomial fitting
+% xFit = polyfit(tSol,xSol,nFit);
+% yFit = polyfit(tSol,ySol,nFit);
+% uFit = polyfit(tSol,uSol,nFit);
+% 
+% figure(2); clf;
+% subplot(3,1,1); hold on;
+% plot(tSol,xSol,'k.','MarkerSize',15)
+% plot(tSol,polyval(xFit,tSol),'r-')
+% xlim(tSpan);
+% ylabel('x')
+% title('Polynomial approximation of trajectory')
+% subplot(3,1,2); hold on;
+% plot(tSol,ySol,'k.','MarkerSize',15)
+% plot(tSol,polyval(yFit,tSol),'r-')
+% xlim(tSpan);
+% ylabel('y')
+% subplot(3,1,3); hold on;
+% plot(tSol,uSol,'k.','MarkerSize',15)
+% plot(tSol,polyval(uFit,tSol),'r-')
+% xlim(tSpan);
+% ylabel('u')
+% xlabel('t')
+
+
+%~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~%
+%                    Compute LQR Gains along trajectory                   %
+%~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~%
+
+Q = 1e-1*eye(2);  % Running cost on state  
+R = 1e-1;       % Running cost on input  
+F = 500*eye(2);  % Terminal cost on state 
+nState = size(Q,1);
+nInput = size(R,1);
+nTime = 70;
+tol = 1e-3;  % Accuracy of ricatti propagation
+
+
+prev_J = getCost(tSol,xSol,ySol,uSol,Q, R, F, xN);
+new_J = prev_J;
+uff = uSol;
+K1 = zeros(nTime,1);
+K2 = zeros(nTime,1);
+for iter=1:70
+    fail = 0;
+    Soln = trackingLqr(tSol,xSol,ySol,uSol,Q,R,F,xN, tol);
+    alpha_d = 1.5;
+    alpha = 1*alpha_d;
+    count = 0;
+    tmp_J = 99;
+    while new_J >= prev_J
+        count = count + 1;
+        alpha = alpha/alpha_d;
+
+        uff = uSol;
+        % update controller
+        for idx=1:nTime
+            uff(idx) = uff(idx) + alpha*Soln(idx).uff;
+            K1(idx) = Soln(idx).K(1);
+            K2(idx) = Soln(idx).K(2);
+        end
+
+        controller = @(t,z) feedbackCtrl(t,z,tSol,xSol,ySol,uff,K1,K2);
+        userFunc = @(t,z)rhs(t,z,controller(t,z));
+        sol2 = ode45(userFunc,tSpan,x0,options);
+
+        tSol2 = linspace(sol2.x(1),sol2.x(end),nTime);
+        zSol2 = deval(sol2,tSol);
+        xSol2 = zSol2(1,:);
+        ySol2 = zSol2(2,:);
+        uSol2 = controller(tSol2,zSol2);
+        tSpan2 = [tSol2(1),tSol2(end)];
+        new_J = getCost(tSol2,xSol2,ySol2,uSol2,Q, R, F, xN);
+        figure(1);
+        plot(xSol2,ySol2,'b-','LineWidth',1);
+        if (abs(new_J-tmp_J)/tmp_J)< 1e-3
+            converge = 1;
+            break;
+        end
+        tmp_J = new_J;
+        if( count > 50)
+            disp('fail')
+            fail = 1;
+            break;
+        end
+    end
+    prev_J = new_J;
+    tSol =tSol2;
+    xSol = xSol2;
+    ySol = ySol2;
+    uSol = uSol2;
+    
+    figure(1);
+    plot(xSol,ySol,'r-','LineWidth',3);
+    plot(x0(1),x0(2),'ro','MarkerSize',10,'LineWidth',2)
+    axis(1.2*[xLim,yLim]); axis equal;
+    if (fail == 1)
+        disp('break')
+        break;
+    end
+end
+
+
